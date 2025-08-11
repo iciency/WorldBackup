@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "endstone-world-backup"
+version = "0.1.0"
+dependencies = []
+authors = [
+    { name = "Your Name", email = "your-email@example.com" },
+]
+description = "A plugin to back up the server world for Endstone."
+readme = "README.md"
+license = { file = "LICENSE" }
+keywords = ["endstone", "plugin"]
+
+[project.urls]
+Homepage = "https://github.com/your-repo/endstone-world-backup"
+
+[project.entry-points."endstone"]
+world_backup = "endstone_world_backup:WorldBackupPlugin"
