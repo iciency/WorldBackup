@@ -11,7 +11,6 @@ authors = [
 ]
 description = "A plugin to back up the server world for Endstone."
 readme = "README.md"
-license = { file = "LICENSE" }
 keywords = ["endstone", "plugin"]
 
 [project.urls]
