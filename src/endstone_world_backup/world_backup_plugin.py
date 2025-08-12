@@ -1,5 +1,6 @@
 import datetime
 import os
+import threading
 import traceback
 import zipfile
 from endstone.plugin import Plugin
@@ -104,77 +105,87 @@ class WorldBackupPlugin(Plugin):
                 sender.send_message(message)
             return False
 
-        self.is_backing_up = True
-        if not is_auto:
-            sender.send_message("Starting world backup...")
-        
-        try:
-            # Construct the world path from server CWD and level name
-            level_name = sender.server.level.name
-            # Most Bedrock servers store worlds in a 'worlds' sub-directory
-            world_path = os.path.join(os.getcwd(), "worlds", level_name)
-
-            if not os.path.isdir(world_path):
-                message = f"Error: World directory not found at '{world_path}'"
-                sender.send_message(message)
-                self.logger.error(message)
-                return False
-
-            backup_path_str = self.config.get("backup-path")
-
-            if backup_path_str:
-                if not os.path.isabs(backup_path_str):
-                    backup_dir = os.path.join(os.getcwd(), backup_path_str)
-                else:
-                    backup_dir = backup_path_str
-            else:
-                backup_dir = os.path.join(self.data_folder, "backups")
-
+        def _backup_task():
+            self.is_backing_up = True
             try:
-                os.makedirs(backup_dir, exist_ok=True)
-            except PermissionError:
-                self.logger.error(f"Permission denied to create backup directory at: {backup_dir}")
+                # NOTE: A reliable method to force-save the world via the Endstone API is not available.
+                # Previous attempts (save(), dispatch_command('save-all'), reload_data()) have failed
+                # or caused server instability. The backup will proceed with the latest data
+                # already written to disk by the server's own auto-save mechanism.
+
+                # Construct the world path from server CWD and level name
+                level_name = sender.server.level.name
+                # Most Bedrock servers store worlds in a 'worlds' sub-directory
+                world_path = os.path.join(os.getcwd(), "worlds", level_name)
+
+                if not os.path.isdir(world_path):
+                    message = f"Error: World directory not found at '{world_path}'"
+                    self.logger.error(message)
+                    if not is_auto:
+                        self.server.scheduler.run_task(self, lambda: sender.send_message(message))
+                    return
+
+                backup_path_str = self.config.get("backup-path")
+
+                if backup_path_str:
+                    if not os.path.isabs(backup_path_str):
+                        backup_dir = os.path.join(os.getcwd(), backup_path_str)
+                    else:
+                        backup_dir = backup_path_str
+                else:
+                    backup_dir = os.path.join(self.data_folder, "backups")
+
+                try:
+                    os.makedirs(backup_dir, exist_ok=True)
+                except PermissionError:
+                    self.logger.error(f"Permission denied to create backup directory at: {backup_dir}")
+                    if not is_auto:
+                        self.server.scheduler.run_task(self, lambda: sender.send_message("Permission denied to create backup directory. Check console for details."))
+                    return
+
+                timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                backup_file_name = f"world_backup_{timestamp}.zip"
+                backup_path = os.path.join(backup_dir, backup_file_name)
+
+                files_skipped = 0
+                with zipfile.ZipFile(backup_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    for root, dirs, files in os.walk(world_path):
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            arcname = os.path.relpath(file_path, world_path)
+                            try:
+                                zipf.write(file_path, arcname)
+                            except FileNotFoundError:
+                                files_skipped += 1
+                                self.logger.warning(f"Skipped a file that was deleted during backup: {arcname}")
+
+                success_message = f"World backup successful! Saved to {backup_path}"
+                if files_skipped > 0:
+                    success_message += f" ({files_skipped} files were skipped as they were modified during backup)"
+                
+                if is_auto:
+                    self.logger.info(success_message)
+                else:
+                    self.server.scheduler.run_task(self, lambda: sender.send_message(success_message))
+                
+                # Clean up old backups
+                self._manage_backups(backup_dir)
+                
+            except Exception as e:
+                error_message = f"An unhandled error occurred during backup: {e}\n{traceback.format_exc()}"
+                self.logger.error(error_message)
                 if not is_auto:
-                    sender.send_message("Permission denied to create backup directory. Check console for details.")
-                self.is_backing_up = False
-                return False
+                    self.server.scheduler.run_task(self, lambda: sender.send_message("An unhandled error occurred during backup. Check the server console for details."))
+            finally:
+                self.is_backing_up = False  # Release the lock
 
-            timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            backup_file_name = f"world_backup_{timestamp}.zip"
-            backup_path = os.path.join(backup_dir, backup_file_name)
-
-            files_skipped = 0
-            with zipfile.ZipFile(backup_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                for root, dirs, files in os.walk(world_path):
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        arcname = os.path.relpath(file_path, world_path)
-                        try:
-                            zipf.write(file_path, arcname)
-                        except FileNotFoundError:
-                            files_skipped += 1
-                            self.logger.warning(f"Skipped a file that was deleted during backup: {arcname}")
-
-            success_message = f"World backup successful! Saved to {backup_path}"
-            if files_skipped > 0:
-                success_message += f" ({files_skipped} files were skipped as they were modified during backup)"
-            if is_auto:
-                self.logger.info(success_message)
-            else:
-                sender.send_message(success_message)
-            
-            # Clean up old backups
-            self._manage_backups(backup_dir)
-            
-            return True
-        except Exception as e:
-            error_message = f"An unhandled error occurred during backup: {e}\n{traceback.format_exc()}"
-            self.logger.error(error_message)
-            if not is_auto:
-                sender.send_message("An unhandled error occurred during backup. Check the server console for details.")
-            return False
-        finally:
-            self.is_backing_up = False  # Release the lock
+        if not is_auto:
+            sender.send_message("Starting world backup in the background...")
+        
+        backup_thread = threading.Thread(target=_backup_task)
+        backup_thread.start()
+        
+        return True
 
     def _manage_backups(self, backup_dir: str):
         backup_management_config = self.config.get("backup-management", {})
