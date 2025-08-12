@@ -3,8 +3,12 @@ import os
 import threading
 import traceback
 import zipfile
+
+from endstone import Player
+from endstone.command import Command, CommandSender, ConsoleCommandSender
+from endstone.permissions import Permission, PermissionDefault, PermissionLevel
 from endstone.plugin import Plugin
-from endstone.command import Command, CommandSender
+
 
 class WorldBackupPlugin(Plugin):
     api_version = "0.6"
@@ -12,6 +16,13 @@ class WorldBackupPlugin(Plugin):
         "backup": {
             "description": "Backs up the server world.",
             "aliases": ["wb"],
+            "permission": "worldbackup.command.backup",
+        }
+    }
+    permissions = {
+        "worldbackup.command.backup": {
+            "description": "Allows the user to run the backup command",
+            "default": PermissionDefault.OP,
         }
     }
 
@@ -66,6 +77,10 @@ class WorldBackupPlugin(Plugin):
 
     def on_command(self, sender: CommandSender, command: Command, args: list[str]) -> bool:
         if command.name.lower() == "backup":
+            # Double-check permission in case the declarative permission fails
+            if isinstance(sender, Player) and not sender.permission_level.value >= PermissionLevel.OP.value:
+                sender.send_error_message("You do not have permission to use this command.")
+                return True
             return self._execute_backup(sender, is_auto=False)
         return False
 
@@ -102,6 +117,8 @@ class WorldBackupPlugin(Plugin):
             if is_auto:
                 self.logger.warning(message)
             else:
+                # The permission check should prevent non-ops from getting this far,
+                # but we'll message them just in case.
                 sender.send_message(message)
             return False
 
@@ -122,7 +139,7 @@ class WorldBackupPlugin(Plugin):
                     message = f"Error: World directory not found at '{world_path}'"
                     self.logger.error(message)
                     if not is_auto:
-                        self.server.scheduler.run_task(self, lambda: sender.send_message(message))
+                        self._broadcast_to_ops(message)
                     return
 
                 backup_path_str = self.config.get("backup-path")
@@ -140,14 +157,28 @@ class WorldBackupPlugin(Plugin):
                 except PermissionError:
                     self.logger.error(f"Permission denied to create backup directory at: {backup_dir}")
                     if not is_auto:
-                        self.server.scheduler.run_task(self, lambda: sender.send_message("Permission denied to create backup directory. Check console for details."))
+                        self._broadcast_to_ops("Permission denied to create backup directory. Check console for details.")
                     return
 
                 timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
                 backup_file_name = f"world_backup_{timestamp}.zip"
                 backup_path = os.path.join(backup_dir, backup_file_name)
 
+                # First, count the total number of files to back up for progress reporting
+                total_files = 0
+                for _, _, files in os.walk(world_path):
+                    total_files += len(files)
+                
+                if total_files == 0:
+                    self.logger.warning("No files found in the world directory to back up.")
+                    if not is_auto:
+                        self._broadcast_to_ops("Warning: No files found to back up.")
+                    return
+
                 files_skipped = 0
+                files_processed = 0
+                last_reported_progress = -1
+
                 with zipfile.ZipFile(backup_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
                     for root, dirs, files in os.walk(world_path):
                         for file in files:
@@ -158,15 +189,21 @@ class WorldBackupPlugin(Plugin):
                             except FileNotFoundError:
                                 files_skipped += 1
                                 self.logger.warning(f"Skipped a file that was deleted during backup: {arcname}")
+                            
+                            files_processed += 1
+                            progress = int((files_processed / total_files) * 100)
+
+                            # Report progress every 10%
+                            if progress >= last_reported_progress + 10:
+                                last_reported_progress = progress
+                                progress_message = f"Backup in progress: {progress}% ({files_processed}/{total_files} files)"
+                                self._broadcast_to_ops(progress_message)
 
                 success_message = f"World backup successful! Saved to {backup_path}"
                 if files_skipped > 0:
                     success_message += f" ({files_skipped} files were skipped as they were modified during backup)"
                 
-                if is_auto:
-                    self.logger.info(success_message)
-                else:
-                    self.server.scheduler.run_task(self, lambda: sender.send_message(success_message))
+                self._broadcast_to_ops(success_message)
                 
                 # Clean up old backups
                 self._manage_backups(backup_dir)
@@ -174,18 +211,29 @@ class WorldBackupPlugin(Plugin):
             except Exception as e:
                 error_message = f"An unhandled error occurred during backup: {e}\n{traceback.format_exc()}"
                 self.logger.error(error_message)
-                if not is_auto:
-                    self.server.scheduler.run_task(self, lambda: sender.send_message("An unhandled error occurred during backup. Check the server console for details."))
+                self._broadcast_to_ops("An unhandled error occurred during backup. Check the server console for details.")
             finally:
                 self.is_backing_up = False  # Release the lock
 
-        if not is_auto:
-            sender.send_message("Starting world backup in the background...")
+        self._broadcast_to_ops("Starting world backup in the background...")
         
         backup_thread = threading.Thread(target=_backup_task)
         backup_thread.start()
         
         return True
+
+    def _broadcast_to_ops(self, message: str):
+        """Broadcasts a message to all online operators and the console."""
+        self.logger.info(message)  # Always log to console
+        
+        def task():
+            for player in self.server.online_players:
+                # In Endstone, OP is a permission level.
+                if player.permission_level.value >= PermissionLevel.OP.value:
+                    player.send_message(message)
+        
+        # Run in the main server thread
+        self.server.scheduler.run_task(self, task)
 
     def _manage_backups(self, backup_dir: str):
         backup_management_config = self.config.get("backup-management", {})
